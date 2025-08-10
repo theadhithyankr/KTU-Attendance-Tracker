@@ -854,7 +854,14 @@ export default function App() {
           </View>
 
           <View style={styles.card}>
-          <Text style={styles.cardTitle}>📚 Subject Details</Text>
+          <Text style={styles.cardTitle}>
+            {editingIndex !== -1 ? "✏️ Edit Subject" : "📚 Subject Details"}
+          </Text>
+          {editingIndex !== -1 && (
+            <Text style={styles.editingNotice}>
+              📝 You are editing: {currentSubject.code} - {currentSubject.name}
+            </Text>
+          )}
           <Text style={[styles.helpText, {marginBottom: 8}]}>
             {userProfile.semester} · {userProfile.branch}
           </Text>
@@ -1601,6 +1608,16 @@ const styles = StyleSheet.create({
     fontWeight: "bold",
     color: "#f0f6fc",
     marginBottom: 16,
+  },
+  editingNotice: {
+    fontSize: 14,
+    color: "#d29922",
+    backgroundColor: "#2d2102",
+    padding: 12,
+    borderRadius: 8,
+    marginBottom: 16,
+    textAlign: "center",
+    fontWeight: "600",
   },
   inputGroup: {
     marginBottom: 16,
