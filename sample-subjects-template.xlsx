@@ -1,0 +1,16 @@
+This is a placeholder for the Excel template. Create an Excel file with these columns:
+
+Headers (Row 1):
+- Code (Subject Code like CS401)
+- Name (Subject Name like Database Management Systems)
+- TotalClasses (Total number of classes)
+- Attended (Number of classes attended)
+- TargetAttendance (Target percentage, default 75)
+- IsPwd (true/false for PWD relaxation)
+- DutyLeaves (Number of duty leaves)
+- CondonationUsed (Number of condonations used 0-2)
+- IsMaternity (true/false for maternity leave)
+- MaternityExcused (Classes excused due to maternity)
+
+Example data (Row 2):
+CS401, Database Management Systems, 45, 38, 75, false, 2, 0, false, 0

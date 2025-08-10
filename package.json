@@ -9,13 +9,20 @@
     "web": "expo start --web"
   },
   "dependencies": {
-    "@react-native-async-storage/async-storage": "^2.2.0",
-    "@react-native-community/slider": "^4.5.7",
+    "@react-native-async-storage/async-storage": "^2.1.2",
+    "@react-native-community/slider": "^4.5.6",
     "@react-native-picker/picker": "^2.11.1",
     "expo": "~53.0.20",
+    "expo-file-system": "~18.1.11",
+    "expo-document-picker": "^13.1.6",
+    "expo-media-library": "^17.1.7",
     "expo-status-bar": "~2.2.3",
     "react": "19.0.0",
-    "react-native": "0.79.5"
+    "react-native": "0.79.5",
+    "react-native-fs": "^2.20.0",
+    "react-native-paper": "^5.14.5",
+    "react-native-vector-icons": "^10.3.0",
+    "xlsx": "^0.18.5"
   },
   "devDependencies": {
     "@babel/core": "^7.20.0"

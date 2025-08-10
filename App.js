@@ -1,8 +1,26 @@
 import React, { useState, useEffect } from "react";
-import { View, Text, TextInput, Switch, Button, StyleSheet, ScrollView, Alert, TouchableOpacity, BackHandler, Modal } from "react-native";
+import { View, StyleSheet, ScrollView, Alert, TouchableOpacity, BackHandler, Modal, Image, Platform, Linking, Slider } from "react-native";
+import { 
+  TextInput, 
+  Button, 
+  Switch, 
+  Card, 
+  IconButton, 
+  Text, 
+  Surface,
+  Appbar,
+  Menu,
+  Divider,
+  Chip,
+  FAB,
+  Icon
+} from 'react-native-paper';
 import { StatusBar } from 'expo-status-bar';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { COURSES, getSemesters, getSubjects } from './subjectsData';
+import * as DocumentPicker from 'expo-document-picker';
+import * as XLSX from 'xlsx';
+import * as FileSystem from 'expo-file-system';
 
 export default function App() {
   // Navigation state: profile setup -> subject management -> results
@@ -17,6 +35,14 @@ export default function App() {
   const [gender, setGender] = useState("");
   const [showResults, setShowResults] = useState(false);
   const [subjects, setSubjects] = useState([]);
+  const [importedData, setImportedData] = useState([]);
+  const [currentImportIndex, setCurrentImportIndex] = useState(0);
+  const [isFinalAttendance, setIsFinalAttendance] = useState(false);
+  
+  // Debug: Monitor subjects state changes
+  useEffect(() => {
+    console.log('Subjects state changed:', subjects.length, subjects.map(s => s.code));
+  }, [subjects]);
   const [selectedCourse, setSelectedCourse] = useState("");
   const [selectedSemester, setSelectedSemester] = useState("");
   const [availableSemesters, setAvailableSemesters] = useState([]);
@@ -29,6 +55,18 @@ export default function App() {
   const [alertTitle, setAlertTitle] = useState("");
   const [alertMessage, setAlertMessage] = useState("");
   const [alertActions, setAlertActions] = useState([]);
+  const [proteinShakeModalVisible, setProteinShakeModalVisible] = useState(false);
+  const [proteinShakeAmount, setProteinShakeAmount] = useState(50);
+
+  // Protein shake descriptions
+  const proteinShakeDescriptions = {
+    5: "One spoon of protein powder",
+    25: "Half cup of protein shake",
+    50: "One full cup of protein shake",
+    75: "Tall glass of protein shake",
+    100: "One blender's worth of protein shake",
+    1000: "A swimming pool filled with protein shake"
+  };
   const [showCourseDropdown, setShowCourseDropdown] = useState(false);
   const [showSemesterDropdown, setShowSemesterDropdown] = useState(false);
   const [showSubjectDropdown, setShowSubjectDropdown] = useState(false);
@@ -348,6 +386,7 @@ export default function App() {
               const updatedSubjects = [...subjects];
               updatedSubjects[existingIndex] = { ...currentSubject, gender };
               setSubjects(updatedSubjects);
+              AsyncStorage.setItem('subjects', JSON.stringify(updatedSubjects));
               resetCurrentSubject();
               setAlertVisible(false);
             }
@@ -362,10 +401,13 @@ export default function App() {
       const updatedSubjects = [...subjects];
       updatedSubjects[editingIndex] = { ...currentSubject, gender };
       setSubjects(updatedSubjects);
+      AsyncStorage.setItem('subjects', JSON.stringify(updatedSubjects));
       setEditingIndex(-1);
     } else {
       // Add new subject
-      setSubjects([...subjects, { ...currentSubject, gender }]);
+      const newSubjects = [...subjects, { ...currentSubject, gender }];
+      setSubjects(newSubjects);
+      AsyncStorage.setItem('subjects', JSON.stringify(newSubjects));
     }
     
     resetCurrentSubject();
@@ -405,6 +447,7 @@ export default function App() {
   const removeSubject = (index) => {
     const newSubjects = subjects.filter((_, i) => i !== index);
     setSubjects(newSubjects);
+    AsyncStorage.setItem('subjects', JSON.stringify(newSubjects));
   };
 
   const goToResults = () => {
@@ -483,7 +526,21 @@ export default function App() {
   };
 
   const getRemainingClasses = (total, attended, dutyLeaves = 0) => {
-    return Math.max(0, total - attended - Number(dutyLeaves));
+    // If someone has 100% attendance (attended equals total), they likely entered
+    // total as "classes held so far" not "total expected for semester"
+    // In this case, we should assume more classes are coming
+    const attendedNum = Number(attended);
+    const totalNum = Number(total);
+    
+    if (attendedNum === totalNum && attendedNum > 0) {
+      // User has 100% attendance - assume more classes will happen
+      // Use a reasonable buffer (25% more classes expected)
+      const estimatedFutureClasses = Math.ceil(totalNum * 0.25);
+      return estimatedFutureClasses;
+    }
+    
+    // Normal case: remaining classes = total planned - attended
+    return Math.max(0, totalNum - attendedNum);
   };
 
   const classesNeededForTarget = (attended, total, target, dutyLeaves = 0) => {
@@ -494,7 +551,7 @@ export default function App() {
     return Math.ceil(stillNeeded);
   };
 
-  const evaluateSubject = (subject) => {
+  const evaluateSubject = (subject, isFinal = false) => {
     const adjusted = adjustForMaternity(subject);
     const total = adjusted.total;
     const attended = Number(subject.attended);
@@ -505,12 +562,50 @@ export default function App() {
     const effectiveMin = getEffectiveMin(subject);
     const remaining = getRemainingClasses(total, attended, dutyLeaves);
 
+    // If this is final attendance, show different messaging
+    if (isFinal) {
+      if (currentPercent >= targetAttendance) {
+        return {
+          status: `Final: Target Achieved (${targetAttendance}%)`,
+          currentPercent,
+          targetAttendance,
+          isFinal: true
+        };
+      } else if (currentPercent >= effectiveMin) {
+        return {
+          status: `Final: University Min Met (${effectiveMin}%)`,
+          currentPercent,
+          effectiveMin,
+          isFinal: true
+        };
+      } else if (currentPercent >= 60 && Number(subject.condonationUsed) < 2) {
+        return {
+          status: "Final: Condonation Needed (60%)",
+          currentPercent,
+          target: 60,
+          isFinal: true
+        };
+      } else {
+        let reason = [];
+        if (currentPercent < 60) reason.push("Below 60% minimum");
+        if (Number(subject.condonationUsed) >= 2) reason.push("Condonation limit exceeded");
+        return {
+          status: "Final: Ineligible",
+          currentPercent,
+          reason: reason.join(", "),
+          isFinal: true
+        };
+      }
+    }
+
+    // Original logic for ongoing semester (not final)
     // Check against user's target first
     if (currentPercent >= targetAttendance) {
       const mustAttend = classesNeededForTarget(attended, total, targetAttendance, dutyLeaves);
       const canBunk = Math.max(0, remaining - mustAttend);
+      
       return {
-        status: `✅ Target Achieved (${targetAttendance}%)`,
+        status: `Target Achieved (${targetAttendance}%)`,
         currentPercent,
         targetAttendance,
         mustAttend,
@@ -523,7 +618,7 @@ export default function App() {
       const mustAttend = classesNeededForTarget(attended, total, effectiveMin, dutyLeaves);
       const canBunk = Math.max(0, remaining - mustAttend);
       return {
-        status: "✅ University Min Met",
+        status: "University Min Met",
         currentPercent,
         effectiveMin,
         mustAttend,
@@ -533,14 +628,23 @@ export default function App() {
     } 
     // Check condonation eligibility
     else if (currentPercent >= 60 && Number(subject.condonationUsed) < 2) {
-      const mustAttend = classesNeededForTarget(attended, total, 60, dutyLeaves);
-      const canBunk = Math.max(0, remaining - mustAttend);
+      // For condonation cases, show what's needed to reach target (not just 60%)
+      const mustAttendForTarget = classesNeededForTarget(attended, total, targetAttendance, dutyLeaves);
+      const mustAttendFor60 = classesNeededForTarget(attended, total, 60, dutyLeaves);
+      
+      console.log('Condonation case:', { 
+        attended, total, dutyLeaves, currentPercent, targetAttendance,
+        mustAttendForTarget, mustAttendFor60, remaining 
+      });
+      
       return {
-        status: "⚠️ Condonation Needed",
+        status: "Condonation Needed",
         currentPercent,
-        target: 60,
-        mustAttend,
-        canBunk,
+        target: 60, // Minimum needed
+        targetAttendance, // Ideal target
+        mustAttend: mustAttendForTarget, // Classes needed to reach ideal target
+        mustAttendFor60, // Classes needed to maintain 60%
+        canBunk: Math.max(0, remaining - mustAttendForTarget), // Very limited bunking
         remaining
       };
     } 
@@ -556,7 +660,7 @@ export default function App() {
       );
       
       return {
-        status: "❌ Ineligible",
+        status: "Ineligible",
         currentPercent,
         reason,
         classesNeededForTarget,
@@ -570,12 +674,12 @@ export default function App() {
     
     const totalSubjects = subjects.length;
     const eligibleCount = subjects.filter(s => {
-      const result = evaluateSubject(s);
-      return result.status.includes("Eligible") || result.status.includes("Condonation");
+      const result = evaluateSubject(s, isFinalAttendance);
+      return result.currentPercent >= 75; // Only count subjects with 75%+ attendance as eligible
     }).length;
     
     const avgAttendance = subjects.reduce((sum, subject) => {
-      const result = evaluateSubject(subject);
+      const result = evaluateSubject(subject, isFinalAttendance);
       return sum + result.currentPercent;
     }, 0) / totalSubjects;
 
@@ -586,51 +690,382 @@ export default function App() {
     };
   };
 
+  // Excel/CSV Import Function with robust file reading & flexible header mapping
+  const importFromExcel = async () => {
+    try {
+      const result = await DocumentPicker.getDocumentAsync({
+        type: ['application/vnd.ms-excel', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'text/csv', 'text/comma-separated-values'],
+        copyToCacheDirectory: true,
+        multiple: false,
+      });
+
+      if (result.canceled || !result.assets || result.assets.length === 0) {
+        return;
+      }
+
+      const file = result.assets[0];
+      console.log('Selected file:', file.name, file.mimeType, file.size);
+      
+      showAlert("Processing", "Reading and processing your file...");
+
+      let data = [];
+      // Helper: normalize header keys
+      const normalizeKey = (k) => String(k || '')
+        .toLowerCase()
+        .replace(/[^a-z0-9%]/g, '') // drop spaces & punctuation
+        .trim();
+      // Helper: robust CSV parsing supporting quoted commas
+      const parseCSV = (text) => {
+        const rows = [];
+        let i = 0, field = '', row = [], inQuotes = false;
+        const pushField = () => { row.push(field); field = ''; };
+        const pushRow = () => { rows.push(row); row = []; };
+        while (i < text.length) {
+          const ch = text[i];
+          if (inQuotes) {
+            if (ch === '"') {
+              if (text[i + 1] === '"') { field += '"'; i += 2; continue; } // escaped quote
+              inQuotes = false; i++; continue;
+            }
+            field += ch; i++; continue;
+          }
+          if (ch === '"') { inQuotes = true; i++; continue; }
+          if (ch === ',') { pushField(); i++; continue; }
+          if (ch === '\n') { pushField(); pushRow(); i++; continue; }
+          if (ch === '\r') { // handle CRLF
+            if (text[i + 1] === '\n') { i += 2; } else { i++; }
+            pushField(); pushRow();
+            continue;
+          }
+          field += ch; i++;
+        }
+        // last field/row
+        pushField(); if (row.length > 1 || (row.length === 1 && row[0] !== '')) pushRow();
+        return rows;
+      };
+      // Helper: map row by headers
+      const toObjects = (rows, headerRowIndex) => {
+        const headers = rows[headerRowIndex].map(h => (h || '').replace(/"/g, '').trim());
+        const out = [];
+        for (let r = headerRowIndex + 1; r < rows.length; r++) {
+          const line = rows[r];
+          if (!line || line.every(c => String(c || '').trim() === '')) continue;
+          const obj = {};
+          headers.forEach((h, idx) => { obj[h] = (line[idx] ?? '').toString().trim(); });
+          out.push(obj);
+        }
+        return out;
+      };
+      
+      try {
+        if (file.name.toLowerCase().endsWith('.csv') || (file.mimeType && file.mimeType.includes('csv'))) {
+          // For CSV files, try to read as text
+          console.log('Processing CSV file');
+          let text;
+          try {
+            // First try with FileSystem (works on iOS and some Android cases)
+            text = await FileSystem.readAsStringAsync(file.uri, { encoding: FileSystem.EncodingType.UTF8 });
+          } catch (fsError) {
+            // If FileSystem fails, try fetch for content:// URIs on Android
+            console.log('FileSystem failed, trying fetch:', fsError.message);
+            const response = await fetch(file.uri);
+            text = await response.text();
+          }
+          console.log('CSV content length:', text.length);
+          const rows = parseCSV(text);
+          console.log('CSV parsed rows:', rows.length);
+          // Detect header row: look for 'Sl.No.' or 'Course Name' or any cell containing 'course'
+          let headerRowIndex = rows.findIndex(r => 
+            r.some(c => /sl\.?no\.?/i.test(c) || /course.*name/i.test(c) || /^course$/i.test(c))
+          );
+          if (headerRowIndex === -1 && rows.length > 0) headerRowIndex = 0; // fallback to first row
+          const objects = toObjects(rows, headerRowIndex);
+          data = objects;
+        } else {
+          // For Excel files, read as base64
+          console.log('Processing Excel file');
+          let b64;
+          try {
+            b64 = await FileSystem.readAsStringAsync(file.uri, { encoding: FileSystem.EncodingType.Base64 });
+          } catch (fsError) {
+            // If FileSystem fails, try fetch and convert to base64
+            console.log('FileSystem failed, trying fetch for Excel:', fsError.message);
+            const response = await fetch(file.uri);
+            const arrayBuffer = await response.arrayBuffer();
+            const uint8Array = new Uint8Array(arrayBuffer);
+            b64 = btoa(String.fromCharCode.apply(null, uint8Array));
+          }
+          const workbook = XLSX.read(b64, { type: 'base64' });
+          const sheetName = workbook.SheetNames[0];
+          const worksheet = workbook.Sheets[sheetName];
+          const rawData = XLSX.utils.sheet_to_json(worksheet, { header: 1, blankrows: false });
+          // Find header row: includes 'Sl.No.' or 'Course Name' (case-insensitive)
+          let headerRowIndex = -1;
+          for (let i = 0; i < rawData.length; i++) {
+            const row = rawData[i];
+            if (row && row.some(cell => 
+              /sl\.?no\.?/i.test(String(cell)) || 
+              /course.*name/i.test(String(cell)) || 
+              /^course$/i.test(String(cell))
+            )) { 
+              headerRowIndex = i; 
+              break; 
+            }
+          }
+          if (headerRowIndex === -1) headerRowIndex = 0;
+          // Convert to objects
+          const rows = rawData;
+          const headers = rows[headerRowIndex].map(h => String(h || '').trim());
+          const objects = [];
+          for (let r = headerRowIndex + 1; r < rows.length; r++) {
+            const row = rows[r];
+            if (!row || row.length === 0 || row.every(c => String(c || '').trim() === '')) continue;
+            const obj = {};
+            headers.forEach((h, idx) => { obj[h] = String(row[idx] ?? '').trim(); });
+            objects.push(obj);
+          }
+          data = objects;
+        }
+      } catch (parseError) {
+        console.error('Parse error:', parseError);
+        setAlertVisible(false);
+        showAlert("Parse Error", `Failed to read file content: ${parseError.message}`);
+        return;
+      }
+
+      console.log('Parsed data rows:', data.length);
+
+      if (data.length === 0) {
+        setAlertVisible(false);
+        showAlert("Error", "No valid course data found in the file. Please check that your file contains course attendance data.");
+        return;
+      }
+
+      // Process the imported data with flexible header mapping (SCMS/Linways variants)
+      const importedSubjects = [];
+      
+      // Debug: log first row to see actual headers
+      if (data.length > 0) {
+        console.log('First row headers:', Object.keys(data[0]));
+        console.log('First row data:', data[0]);
+      }
+      
+      data.forEach((row, index) => {
+        console.log(`Processing row ${index}:`, row);
+        
+        // Skip rows that are totals or empty
+        const firstCol = Object.values(row)[0];
+        if (!firstCol || /total/i.test(String(firstCol)) || String(firstCol).trim() === '') {
+          console.log(`Skipping row ${index}: appears to be total or empty`);
+          return;
+        }
+        
+        const keyMap = Object.keys(row).reduce((acc, k) => { acc[normalizeKey(k)] = k; return acc; }, {});
+        console.log('Normalized keyMap:', keyMap);
+        // Find course name column - try multiple variations including exact SCMS format
+        const courseKey = keyMap['coursename'] || keyMap['course'] || keyMap['subjectname'] || keyMap['subject'] || 
+                         keyMap['coursenamecode'] || keyMap['name'] || keyMap['coursecode'] ||
+                         Object.keys(row).find(k => /course.*name|subject.*name|^course$|^name$/i.test(k)) ||
+                         Object.keys(row)[1]; // SCMS format has Course Name as second column after Sl.No.
+        console.log('Using courseKey:', courseKey);
+        const courseName = String(row[courseKey] || '').trim();
+        if (!courseName) return;
+        
+        const codeMatch = courseName.match(/\(\s*([^)]+)\s*\)/);
+        const subjectCode = codeMatch ? codeMatch[1].trim() : `IMP${index + 1}`;
+        
+        // Clean subject name (remove code in parentheses)
+        const subjectName = courseName.replace(/\s*\([^)]+\)\s*/, '').trim() || `Imported Subject ${index + 1}`;
+        
+        // Map totals/attended/duty leaves with SCMS-specific column names
+        const totalKey = keyMap['th'] || keyMap['totalhours'] || keyMap['totalclasses'] || keyMap['total'] || 
+                        keyMap['periods'] || keyMap['totalperiods'] ||
+                        Object.keys(row).find(k => /^th$|total.*hours?|total.*classes?|total.*periods?/i.test(k));
+        const attendedKey = keyMap['ah'] || keyMap['attendedhours'] || keyMap['attended'] || keyMap['present'] ||
+                           keyMap['attendedclasses'] || keyMap['attendedperiods'] ||
+                           Object.keys(row).find(k => /^ah$|attended.*hours?|attended.*classes?|present/i.test(k));
+        const dutyKey = keyMap['dl'] || keyMap['dutyleaves'] || keyMap['duty'] || keyMap['onduty'] || keyMap['od'] ||
+                       Object.keys(row).find(k => /^dl$|duty.*leaves?|on.*duty|^od$/i.test(k));
+        
+        console.log('Column mapping:', {totalKey, attendedKey, dutyKey});
+        const totalClasses = String(totalKey ? row[totalKey] : '0').replace(/[^0-9]/g, '') || '0';
+        const attended = String(attendedKey ? row[attendedKey] : '0').replace(/[^0-9]/g, '') || '0';
+        const dutyLeaves = String(dutyKey ? row[dutyKey] : '0').replace(/[^0-9]/g, '') || '0';
+        
+        // Set default target attendance to 75% (user can modify later if needed)
+        const targetAttendance = 75;
+
+        const subject = {
+          code: subjectCode,
+          name: subjectName,
+          totalClasses: totalClasses,
+          attended: attended,
+          targetAttendance: targetAttendance,
+          isPwd: false,
+          dutyLeaves: dutyLeaves,
+          condonationUsed: "0",
+          isMaternity: false,
+          maternityExcused: "0",
+          gender: gender
+        };
+
+        console.log('Created subject:', subject);
+        console.log('Current gender value:', gender);
+        importedSubjects.push(subject);
+      });
+
+      console.log('Total subjects created:', importedSubjects.length);
+
+      if (importedSubjects.length === 0) {
+        setAlertVisible(false);
+        showAlert("Error", "No valid subjects could be extracted from the file. Please check the file format.");
+        return;
+      }
+
+      console.log('About to auto-fill form with', importedSubjects.length, 'subjects');
+
+      // Auto-fill the form with first imported subject
+      setImportedData(importedSubjects);
+      setCurrentImportIndex(0);
+      
+      if (importedSubjects.length > 0) {
+        const firstSubject = importedSubjects[0];
+        setCurrentSubject({
+          code: firstSubject.code,
+          name: firstSubject.name,
+          totalClasses: firstSubject.totalClasses,
+          attended: firstSubject.attended,
+          targetAttendance: firstSubject.targetAttendance,
+          isPwd: firstSubject.isPwd,
+          dutyLeaves: firstSubject.dutyLeaves,
+          condonationUsed: firstSubject.condonationUsed,
+          isMaternity: firstSubject.isMaternity,
+          maternityExcused: firstSubject.maternityExcused
+        });
+        
+        showAlert("Import Success", 
+          `Found ${importedSubjects.length} subjects! The first subject has been loaded into the form. Review and click "Add Subject" to save it, then use the navigation buttons to go through the remaining subjects.`
+        );
+      }
+      
+      setAlertVisible(false); // Close the processing alert
+
+    } catch (error) {
+      console.error('Import error:', error);
+      setAlertVisible(false);
+      showAlert("Import Error", `Failed to import file: ${error.message}`);
+    }
+  };
+
+  const loadNextImportedSubject = () => {
+    if (currentImportIndex < importedData.length - 1) {
+      const nextIndex = currentImportIndex + 1;
+      const nextSubject = importedData[nextIndex];
+      setCurrentImportIndex(nextIndex);
+      setCurrentSubject({
+        code: nextSubject.code,
+        name: nextSubject.name,
+        totalClasses: nextSubject.totalClasses,
+        attended: nextSubject.attended,
+        targetAttendance: nextSubject.targetAttendance,
+        isPwd: nextSubject.isPwd,
+        dutyLeaves: nextSubject.dutyLeaves,
+        condonationUsed: nextSubject.condonationUsed,
+        isMaternity: nextSubject.isMaternity,
+        maternityExcused: nextSubject.maternityExcused
+      });
+    }
+  };
+
+  const loadPreviousImportedSubject = () => {
+    if (currentImportIndex > 0) {
+      const prevIndex = currentImportIndex - 1;
+      const prevSubject = importedData[prevIndex];
+      setCurrentImportIndex(prevIndex);
+      setCurrentSubject({
+        code: prevSubject.code,
+        name: prevSubject.name,
+        totalClasses: prevSubject.totalClasses,
+        attended: prevSubject.attended,
+        targetAttendance: prevSubject.targetAttendance,
+        isPwd: prevSubject.isPwd,
+        dutyLeaves: prevSubject.dutyLeaves,
+        condonationUsed: prevSubject.condonationUsed,
+        isMaternity: prevSubject.isMaternity,
+        maternityExcused: prevSubject.maternityExcused
+      });
+    }
+  };
+
+  const clearImportedData = () => {
+    setImportedData([]);
+    setCurrentImportIndex(0);
+    resetCurrentSubject();
+  };
+
   // Render Profile Setup
   if (!isProfileComplete) {
     return (
-  <ScrollView contentContainerStyle={styles.container} keyboardShouldPersistTaps="handled" bounces={false} alwaysBounceVertical={false}>
-  <StatusBar style="light" />
-        <View style={styles.profileSetupContainer}>
-          <Text style={styles.welcomeTitle}>👋 Welcome!</Text>
-          <Text style={styles.appTitle}>Let's set up your profile</Text>
-          <Text style={styles.subtitle}>Only Semester and Branch are required. Everything stays on your device.</Text>
+      <Surface style={styles.container}>
+        <StatusBar style="light" hidden={true} />
+        <ScrollView 
+          contentContainerStyle={styles.profileSetupContainer} 
+          keyboardShouldPersistTaps="handled" 
+          bounces={false} 
+          alwaysBounceVertical={false}
+        >
+          <Surface style={styles.welcomeHeader} elevation={0}>
+            <Text variant="headlineLarge" style={styles.appTitle}>
+              KTU Attendance Tracker
+            </Text>
+            <Text variant="bodyLarge" style={styles.subtitle}>
+              Let's set up your profile to get started
+            </Text>
+          </Surface>
           
-          <View style={styles.privacyNotice}>
-            <Text style={styles.privacyIcon}>🔒</Text>
-            <View style={styles.privacyTextContainer}>
-              <Text style={styles.privacyTitle}>Your Privacy is Protected</Text>
-              <Text style={styles.privacyText}>
-                • All data is stored locally on your device only{"\n"}
-                • Nothing is shared with servers or third parties{"\n"}
-                • Your information never leaves your phone{"\n"}
-                • You can delete all data anytime
+          <Card style={styles.privacyCard} mode="contained">
+            <Card.Content>
+              <View style={{ flexDirection: 'row', alignItems: 'flex-start' }}>
+                <Surface style={styles.privacyIcon} elevation={1}>
+                  <Icon source="lock" size={20} color="#E8EAED" />
+                </Surface>
+                <View style={styles.privacyTextContainer}>
+                  <Text variant="titleMedium" style={styles.privacyTitle}>
+                    Your Privacy is Protected
+                  </Text>
+                  <Text variant="bodySmall" style={styles.privacyText}>
+                    • All data stays on your device only{"\n"}
+                    • Nothing is shared or uploaded{"\n"}
+                    • Complete control over your information
+                  </Text>
+                </View>
+              </View>
+            </Card.Content>
+          </Card>
+          
+          <Card style={styles.profileCard} mode="elevated">
+            <Card.Content>
+              <Text variant="titleLarge" style={styles.cardTitle}>
+                Personal Information
               </Text>
-            </View>
-          </View>
-          
-          <View style={styles.card}>
-            <Text style={styles.cardTitle}>📝 Personal Information</Text>
             
             <View style={styles.inputGroup}>
               <Text style={styles.label}>Full Name</Text>
               <TextInput
-                style={styles.input}
+                mode="outlined"
                 value={userProfile.name}
                 onChangeText={v => handleProfileChange("name", v)}
                 placeholder="Enter your full name"
-                placeholderTextColor="#8b949e"
               />
             </View>
 
             <View style={styles.inputGroup}>
               <Text style={styles.label}>Student ID</Text>
               <TextInput
-                style={styles.input}
+                mode="outlined"
                 value={userProfile.studentId}
                 onChangeText={v => handleProfileChange("studentId", v)}
                 placeholder="e.g., KTU123456"
-                placeholderTextColor="#8b949e"
               />
             </View>
 
@@ -750,7 +1185,7 @@ export default function App() {
             <View style={styles.inputGroup}>
               <Text style={styles.label}>Gender *</Text>
               <Text style={styles.genderNote}>
-                🌟 Fun Fact: Gender benefits are based on biological factors like menstruation cycles, regardless of how you identify! 💪
+                Fun Fact: Gender benefits are based on biological factors like menstruation cycles, regardless of how you identify!
               </Text>
               <View style={styles.genderContainer}>
                 <TouchableOpacity 
@@ -758,7 +1193,7 @@ export default function App() {
                   onPress={() => setGender("female")}
                 >
                   <Text style={[styles.genderText, gender === "female" && styles.selectedGenderText]}>
-                    👩 Female
+                    Female
                   </Text>
                 </TouchableOpacity>
                 
@@ -767,7 +1202,7 @@ export default function App() {
                   onPress={() => setGender("male")}
                 >
                   <Text style={[styles.genderText, gender === "male" && styles.selectedGenderText]}>
-                    👨 Male  
+                    Male
                   </Text>
                 </TouchableOpacity>
               </View>
@@ -776,66 +1211,30 @@ export default function App() {
             <View style={styles.inputGroup}>
               <Text style={styles.label}>College</Text>
               <TextInput
-                style={styles.input}
+                mode="outlined"
                 value={userProfile.college}
                 onChangeText={v => handleProfileChange("college", v)}
                 placeholder="e.g., CET Trivandrum"
-                placeholderTextColor="#8b949e"
               />
             </View>
 
-            <Text style={styles.requiredNote}>* Required: Semester and Branch</Text>
+            <Text variant="bodySmall" style={styles.requiredNote}>
+              * Required: Semester and Branch
+            </Text>
 
-            <View style={styles.privacyReminder}>
-              <Text style={styles.privacyReminderText}>
-                🔐 Reminder: Your data stays on your device and is never shared anywhere
+            <Surface style={styles.privacyReminder} elevation={0}>
+              <Text variant="bodySmall" style={styles.privacyReminderText}>
+                Reminder: Your data stays on your device and is never shared anywhere
               </Text>
-            </View>
+            </Surface>
 
-            <TouchableOpacity style={styles.addButton} onPress={completeProfile}>
-              <Text style={styles.addButtonText}>✅ Complete Profile</Text>
-            </TouchableOpacity>
-          </View>
-        </View>
-        
-        {/* Custom Alert Modal */}
-        <Modal
-          transparent={true}
-          animationType="fade"
-          visible={alertVisible}
-          onRequestClose={() => setAlertVisible(false)}
-        >
-          <View style={styles.alertOverlay}>
-            <View style={styles.alertContainer}>
-              <Text style={styles.alertTitle}>{alertTitle}</Text>
-              <Text style={styles.alertMessage}>{alertMessage}</Text>
-              <View style={styles.alertButtons}>
-                {alertActions.map((action, index) => (
-                  <TouchableOpacity
-                    key={index}
-                    style={[
-                      styles.alertButton,
-                      index === alertActions.length - 1 && alertActions.length > 1 
-                        ? styles.alertButtonDestructive 
-                        : styles.alertButtonDefault
-                    ]}
-                    onPress={action.onPress}
-                  >
-                    <Text style={[
-                      styles.alertButtonText,
-                      index === alertActions.length - 1 && alertActions.length > 1 
-                        ? styles.alertButtonTextDestructive 
-                        : styles.alertButtonTextDefault
-                    ]}>
-                      {action.text}
-                    </Text>
-                  </TouchableOpacity>
-                ))}
-              </View>
-            </View>
-          </View>
-        </Modal>
-      </ScrollView>
+            <Button mode="contained" icon="check-circle" onPress={completeProfile} style={{ marginTop: 8 }}>
+              Complete Profile
+            </Button>
+            </Card.Content>
+          </Card>
+        </ScrollView>
+      </Surface>
     );
   }
 
@@ -844,17 +1243,60 @@ export default function App() {
   // Render Subject Management
   if (isProfileComplete && !showResults) {
     return (
-        <ScrollView contentContainerStyle={styles.container} keyboardShouldPersistTaps="handled" bounces={false}>
-          <StatusBar style="light" />
-          <View style={styles.header}>
-            <Text style={styles.headerTitle}>Add Subjects</Text>
-            <Text style={styles.headerSubtitle}>
-              {userProfile.name} {userProfile.studentId ? `(${userProfile.studentId})` : ''} | {userProfile.semester} · {userProfile.branch} | Gender: {gender || "-"} | {subjects.length} subjects
+      <Surface style={styles.container}>
+        <StatusBar style="light" hidden={true} />
+        <Appbar.Header>
+          <Appbar.Content 
+            title="Add Subjects" 
+            subtitle={`${userProfile.name} | ${userProfile.semester} · ${userProfile.branch} | ${subjects.length} subjects`}
+          />
+          <Appbar.Action 
+            icon="account-edit" 
+            onPress={() => setIsProfileComplete(false)} 
+          />
+        </Appbar.Header>
+        
+        <ScrollView 
+          contentContainerStyle={styles.scrollContent} 
+          keyboardShouldPersistTaps="handled" 
+          bounces={false}
+        >
+          <Card style={styles.subjectCard} mode="elevated">
+            <Card.Content>
+              {/* Import Section */}
+              <View style={styles.importOptionsContainer}>
+                <Button 
+                  mode="contained" 
+                  icon="file-excel" 
+                  onPress={importFromExcel}
+                  style={styles.importButton}
+                  contentStyle={styles.optionButtonContent}
+                >
+                  Import Attendance Report
+                </Button>
+                
+                <Text variant="bodySmall" style={styles.importHelpText}>
+                  Use Linways export functionality to download your attendance report, then import the CSV/Excel file here to auto-fill all subjects
+                </Text>
+                
+                <View style={styles.finalAttendanceContainer}>
+                  <Switch
+                    value={isFinalAttendance}
+                    onValueChange={setIsFinalAttendance}
+                    thumbColor={isFinalAttendance ? '#238636' : '#f4f3f4'}
+                    trackColor={{false: '#767577', true: '#81b0ff'}}
+                  />
+                  <Text style={styles.finalAttendanceLabel}>
+                    This is my final semester attendance (no more classes)
+                  </Text>
+                </View>
+              </View>
+              
+          {editingIndex !== -1 && (
+            <Text style={styles.editingNotice}>
+              You are editing: {currentSubject.code} - {currentSubject.name}
             </Text>
-          </View>
-
-          <View style={styles.card}>
-          <Text style={styles.cardTitle}>📚 Subject Details</Text>
+          )}
           <Text style={[styles.helpText, {marginBottom: 8}]}>
             {userProfile.semester} · {userProfile.branch}
           </Text>
@@ -895,7 +1337,7 @@ export default function App() {
           {/* Display selected subject */}
           {currentSubject.name && (
             <View style={styles.selectedSubjectContainer}>
-              <Text style={styles.selectedSubjectLabel}>✅ Selected Subject:</Text>
+              <Text style={styles.selectedSubjectLabel}>Selected Subject:</Text>
               <Text style={styles.selectedSubject}>
                 {currentSubject.code} - {currentSubject.name}
               </Text>
@@ -909,7 +1351,7 @@ export default function App() {
               onPress={() => setShowCustomSubjectInput(!showCustomSubjectInput)}
             >
               <Text style={styles.customSubjectButtonText}>
-                {showCustomSubjectInput ? "❌ Cancel Custom Subject" : "➕ Add Custom Subject"}
+                {showCustomSubjectInput ? "Cancel Custom Subject" : "Add Custom Subject"}
               </Text>
             </TouchableOpacity>
           </View>
@@ -917,7 +1359,7 @@ export default function App() {
           {showCustomSubjectInput && (
             <View style={styles.customSubjectForm}>
               <View style={styles.inputRow}>
-                <View style={[styles.inputGroup, { flex: 1, marginRight: 10 }]}>
+                <View style={[styles.inputGroup, { flex: 1, marginRight: 8 }]}>
                   <Text style={styles.label}>Subject Code:</Text>
                   <TextInput
                     style={styles.input}
@@ -927,7 +1369,7 @@ export default function App() {
                     placeholderTextColor="#8b949e"
                   />
                 </View>
-                <View style={[styles.inputGroup, { flex: 2, marginLeft: 10 }]}>
+                <View style={[styles.inputGroup, { flex: 2, marginLeft: 8 }]}>
                   <Text style={styles.label}>Subject Name:</Text>
                   <TextInput
                     style={styles.input}
@@ -942,7 +1384,7 @@ export default function App() {
                 style={styles.addCustomButton}
                 onPress={addCustomSubject}
               >
-                <Text style={styles.addCustomButtonText}>✅ Add Custom Subject</Text>
+                <Text style={styles.addCustomButtonText}>Add Custom Subject</Text>
               </TouchableOpacity>
             </View>
           )}
@@ -968,7 +1410,7 @@ export default function App() {
               />
             </View>
 
-            <View style={[styles.inputGroup, { flex: 1, marginLeft: 10 }]}>
+            <View style={[styles.inputGroup, { flex: 1, marginLeft: 8 }]}>
               <Text style={styles.label}>Attended:</Text>
               <TextInput
                 style={styles.input}
@@ -1064,23 +1506,13 @@ export default function App() {
           <View style={styles.switchContainer}>
             <View style={styles.switchRow}>
               <Text style={styles.switchLabel}>PWD Relaxation (-5%)</Text>
-              <Switch
-                value={currentSubject.isPwd}
-                onValueChange={v => handleSwitch("isPwd", v)}
-                trackColor={{ false: "#30363d", true: "#238636" }}
-                thumbColor="#f0f6fc"
-              />
+              <Switch value={currentSubject.isPwd} onValueChange={v => handleSwitch("isPwd", v)} />
             </View>
 
             {gender === "female" && (
               <View style={styles.switchRow}>
                 <Text style={styles.switchLabel}>Maternity Leave</Text>
-                <Switch
-                  value={currentSubject.isMaternity}
-                  onValueChange={v => handleSwitch("isMaternity", v)}
-                  trackColor={{ false: "#30363d", true: "#238636" }}
-                  thumbColor="#f0f6fc"
-                />
+                <Switch value={currentSubject.isMaternity} onValueChange={v => handleSwitch("isMaternity", v)} />
               </View>
             )}
           </View>
@@ -1131,62 +1563,91 @@ export default function App() {
             />
           </View>
 
-          <TouchableOpacity style={styles.addButton} onPress={addSubject}>
-            <Text style={styles.addButtonText}>
-              {editingIndex !== -1 ? "✅ Update Subject" : "➕ Add Subject"}
-            </Text>
-          </TouchableOpacity>
+          <Button mode="contained" onPress={addSubject}>
+            {editingIndex !== -1 ? 'Update Subject' : 'Add Subject'}
+          </Button>
+          
+          {/* Import Navigation */}
+          {importedData.length > 0 && (
+            <View style={styles.importNavigationContainer}>
+              <Text style={styles.importNavigationText}>
+                Imported Subject {currentImportIndex + 1} of {importedData.length}
+              </Text>
+              <View style={styles.importNavigationButtons}>
+                <Button 
+                  mode="outlined" 
+                  onPress={loadPreviousImportedSubject}
+                  disabled={currentImportIndex === 0}
+                  style={styles.navigationButton}
+                >
+                  ← Previous
+                </Button>
+                <Button 
+                  mode="outlined" 
+                  onPress={loadNextImportedSubject}
+                  disabled={currentImportIndex === importedData.length - 1}
+                  style={styles.navigationButton}
+                >
+                  Next →
+                </Button>
+                <Button 
+                  mode="text" 
+                  onPress={clearImportedData}
+                  style={styles.navigationButton}
+                  textColor="#f85149"
+                >
+                  Clear Import
+                </Button>
+              </View>
+            </View>
+          )}
           
           {editingIndex !== -1 && (
-            <TouchableOpacity style={styles.cancelButton} onPress={cancelEdit}>
-              <Text style={styles.cancelButtonText}>❌ Cancel Edit</Text>
-            </TouchableOpacity>
+            <Button mode="outlined" onPress={cancelEdit} style={{ marginTop: 8 }}>
+              Cancel Edit
+            </Button>
           )}
-        </View>
+            </Card.Content>
+          </Card>
 
         {subjects.length > 0 && (
-          <View style={styles.card}>
-            <Text style={styles.cardTitle}>📋 Added Subjects ({subjects.length})</Text>
-            {subjects.map((subject, index) => (
-              <View key={`added-${subject.code || subject.name}-${index}`} style={[
-                styles.subjectItem,
-                editingIndex === index && styles.editingSubject
-              ]}>
-                <View style={styles.subjectInfo}>
-                  <Text style={styles.subjectName}>
-                    {subject.code ? `${subject.code} - ${subject.name}` : subject.name}
-                    {editingIndex === index && " (Editing...)"}
-                  </Text>
-                  <Text style={styles.subjectStats}>
-                    {subject.attended}/{subject.totalClasses} 
-                    {Number(subject.dutyLeaves) > 0 && ` (+${subject.dutyLeaves} duty)`}
-                    {" "}({getCurrentAttendance(Number(subject.attended), Number(subject.totalClasses), Number(subject.dutyLeaves)).toFixed(1)}%)
-                    {" "}| Target: {subject.targetAttendance}%
-                  </Text>
-                </View>
-                <View style={styles.subjectActions}>
-                  <TouchableOpacity 
-                    style={styles.editButton} 
-                    onPress={() => editSubject(index)}
-                  >
-                    <Text style={styles.editButtonText}>✏️</Text>
-                  </TouchableOpacity>
-                  <TouchableOpacity 
-                    style={styles.removeButton} 
-                    onPress={() => removeSubject(index)}
-                  >
-                    <Text style={styles.removeButtonText}>🗑️</Text>
-                  </TouchableOpacity>
-                </View>
-              </View>
-            ))}
-          </View>
+          <Card style={styles.subjectsListCard} mode="elevated">
+            <Card.Content>
+              <Text variant="titleMedium" style={styles.cardTitle}>
+                Added Subjects ({subjects.length})
+              </Text>
+              {subjects.map((subject, index) => (
+                <Surface key={`added-${subject.code || subject.name}-${index}`} 
+                  style={[
+                    styles.subjectItem,
+                    editingIndex === index && styles.editingSubject
+                  ]} 
+                  elevation={editingIndex === index ? 2 : 0}
+                >
+                  <View style={styles.subjectInfo}>
+                    <Text variant="bodyLarge" style={styles.subjectName}>
+                      {subject.code ? `${subject.code} - ${subject.name}` : subject.name}
+                      {editingIndex === index && " (Editing...)"}
+                    </Text>
+                    <Text variant="bodySmall" style={styles.subjectStats}>
+                      {subject.attended}/{subject.totalClasses} 
+                      {Number(subject.dutyLeaves) > 0 && ` (+${subject.dutyLeaves} duty)`}
+                      {" "}({getCurrentAttendance(Number(subject.attended), Number(subject.totalClasses), Number(subject.dutyLeaves)).toFixed(1)}%)
+                      {" "}| Target: {subject.targetAttendance}%
+                    </Text>
+                  </View>
+                  <View style={styles.subjectActions}>
+                    <IconButton icon="pencil" size={20} onPress={() => editSubject(index)} />
+                    <IconButton icon="delete" size={20} onPress={() => removeSubject(index)} />
+                  </View>
+                </Surface>
+              ))}
+            </Card.Content>
+          </Card>
         )}
 
-        <View style={styles.buttonContainer}>
-          <TouchableOpacity 
-            style={styles.secondaryButton}
-            onPress={() => {
+        <Surface style={styles.buttonContainer} elevation={0}>
+          <Button mode="outlined" onPress={() => {
               // Back to Profile
               closeAllDropdowns();
               setShowCustomSubjectInput(false);
@@ -1204,58 +1665,14 @@ export default function App() {
                 maternityExcused: ""
               });
               setIsProfileComplete(false);
-            }}
-          >
-            <Text style={styles.secondaryButtonText}>← Back</Text>
-          </TouchableOpacity>
+            }} style={{ flex: 1, marginRight: 8 }}>← Back</Button>
           
-          <TouchableOpacity 
-            style={[styles.primaryButton, subjects.length === 0 && styles.disabledButton]} 
-            onPress={goToResults}
-            disabled={subjects.length === 0}
-          >
-            <Text style={styles.primaryButtonText}>View Results →</Text>
-          </TouchableOpacity>
-        </View>
-        
-        {/* Custom Alert Modal */}
-        <Modal
-          transparent={true}
-          animationType="fade"
-          visible={alertVisible}
-          onRequestClose={() => setAlertVisible(false)}
-        >
-          <View style={styles.alertOverlay}>
-            <View style={styles.alertContainer}>
-              <Text style={styles.alertTitle}>{alertTitle}</Text>
-              <Text style={styles.alertMessage}>{alertMessage}</Text>
-              <View style={styles.alertButtons}>
-                {alertActions.map((action, index) => (
-                  <TouchableOpacity
-                    key={index}
-                    style={[
-                      styles.alertButton,
-                      index === alertActions.length - 1 && alertActions.length > 1 
-                        ? styles.alertButtonDestructive 
-                        : styles.alertButtonDefault
-                    ]}
-                    onPress={action.onPress}
-                  >
-                    <Text style={[
-                      styles.alertButtonText,
-                      index === alertActions.length - 1 && alertActions.length > 1 
-                        ? styles.alertButtonTextDestructive 
-                        : styles.alertButtonTextDefault
-                    ]}>
-                      {action.text}
-                    </Text>
-                  </TouchableOpacity>
-                ))}
-              </View>
-            </View>
-          </View>
-  </Modal>
-  </ScrollView>
+          <Button mode="contained" onPress={goToResults} disabled={subjects.length === 0} style={{ flex: 1, marginLeft: 8 }}>
+            View Results →
+          </Button>
+        </Surface>
+        </ScrollView>
+      </Surface>
     );
   }
 
@@ -1264,19 +1681,19 @@ export default function App() {
     const overallStats = getOverallStats();
     
     return (
-      <ScrollView contentContainerStyle={styles.container}>
-  <StatusBar style="light" />
+      <ScrollView style={styles.container} contentContainerStyle={styles.resultsContentContainer}>
+        <StatusBar style="light" hidden={true} />
         
-        <View style={styles.header}>
-          <Text style={styles.headerTitle}>📊 Attendance Results</Text>
-          <Text style={styles.headerSubtitle}>
-            {userProfile.name} | {userProfile.semester} {userProfile.branch} | Gender: {gender}
-          </Text>
-        </View>
+        <Appbar.Header>
+          <Appbar.Content 
+            title="Attendance Results" 
+            subtitle={`${userProfile.name} | ${userProfile.semester} ${userProfile.branch} | Gender: ${gender}`}
+          />
+        </Appbar.Header>
 
         {overallStats && (
           <View style={styles.statsCard}>
-            <Text style={styles.statsTitle}>📈 Overall Summary</Text>
+            <Text style={styles.statsTitle}>Overall Summary</Text>
             <View style={styles.statsRow}>
               <View style={styles.statItem}>
                 <Text style={styles.statValue}>{overallStats.totalSubjects}</Text>
@@ -1295,61 +1712,104 @@ export default function App() {
         )}
 
         {subjects.map((subject, index) => {
-          const result = evaluateSubject(subject);
+          const result = evaluateSubject(subject, isFinalAttendance);
           const isEligible = result.status.includes("Eligible");
           const isCondonation = result.status.includes("Condonation");
+          
+          // Color based on actual attendance percentage
+          const isGoodAttendance = result.currentPercent >= 75;
+          const isMediumAttendance = result.currentPercent >= 60 && result.currentPercent < 75;
           
           return (
             <View key={index} style={[
               styles.resultCard,
-              isEligible ? styles.eligibleCard : isCondonation ? styles.condonationCard : styles.ineligibleCard
+              isGoodAttendance ? styles.eligibleCard : isMediumAttendance ? styles.condonationCard : styles.ineligibleCard
             ]}>
               <Text style={styles.subjectNameResult}>
                 {subject.code ? `${subject.code} - ${subject.name}` : subject.name}
               </Text>
               <Text style={[
                 styles.statusText,
-                isEligible ? styles.eligibleText : isCondonation ? styles.condonationText : styles.ineligibleText
+                isGoodAttendance ? styles.eligibleText : isMediumAttendance ? styles.condonationText : styles.ineligibleText
               ]}>
                 {result.status}
               </Text>
               
               <View style={styles.resultStats}>
                 <Text style={styles.resultText}>
-                  Current: {result.currentPercent.toFixed(1)}%
+                  <Text style={{ fontWeight: 'bold' }}>Current:</Text> {result.currentPercent.toFixed(1)}%
+                </Text>
+                <Text style={styles.resultText}>
+                  Total Hours: {(() => {
+                    const adjusted = adjustForMaternity(subject);
+                    return adjusted.total;
+                  })()}
+                </Text>
+                <Text style={styles.resultText}>
+                  Attended: {subject.attended}
                 </Text>
                 <Text style={styles.resultText}>
                   Target: {subject.targetAttendance}%
                 </Text>
                 
-                {(result.status.includes("Target Achieved") || result.status.includes("University Min") || result.status.includes("Condonation")) && (
+                {result.isFinal ? (
+                  <Text style={[styles.resultText, { fontWeight: 'bold', marginTop: 4, color: '#58a6ff' }]}>
+                    📋 Final Semester Result - No more classes to attend
+                  </Text>
+                ) : (
                   <>
-                    <Text style={styles.resultText}>
-                      Must attend: {result.mustAttend} more classes
-                    </Text>
-                    <Text style={styles.resultText}>
-                      Can bunk: {result.canBunk} classes
-                    </Text>
-                    <Text style={styles.resultText}>
-                      Remaining: {result.remaining} classes
-                    </Text>
-                    {Number(subject.dutyLeaves) > 0 && (
-                      <Text style={styles.resultText}>
-                        Duty leaves: {subject.dutyLeaves}
-                      </Text>
+                    {(result.status.includes("Target Achieved") || result.status.includes("University Min")) && (
+                      <>
+                        <Text style={styles.resultText}>
+                          <Text style={{ fontWeight: 'bold' }}>Must attend:</Text> {result.mustAttend} more {result.mustAttend === 1 ? 'class' : 'classes'}
+                        </Text>
+                        <Text style={styles.resultText}>
+                          <Text style={{ fontWeight: 'bold' }}>Can bunk:</Text> {result.canBunk} {result.canBunk === 1 ? 'class' : 'classes'}
+                        </Text>
+                        <Text style={styles.resultText}>
+                          Classes not attended: {result.remaining}
+                        </Text>
+                        {Number(subject.dutyLeaves) > 0 && (
+                          <Text style={styles.resultText}>
+                            Duty leaves: {subject.dutyLeaves}
+                          </Text>
+                        )}
+                      </>
                     )}
-                  </>
-                )}
-                
-                {result.status.includes("Ineligible") && (
-                  <>
-                    <Text style={styles.resultText}>
-                      Reason: {result.reason.join(", ")}
-                    </Text>
-                    {result.classesNeededForTarget > 0 && (
-                      <Text style={styles.resultText}>
-                        Need {result.classesNeededForTarget} more classes for {result.targetAttendance}% target
-                      </Text>
+                    
+                    {result.status.includes("Condonation") && (
+                      <>
+                        <Text style={[styles.resultText, { color: '#f85149' }]}>
+                          ⚠️ <Text style={{ fontWeight: 'bold' }}>Need</Text> {result.mustAttend} {result.mustAttend === 1 ? 'class' : 'classes'} to reach {result.targetAttendance}% target
+                        </Text>
+                        <Text style={styles.resultText}>
+                          Safe to bunk: 0 class (too risky!)
+                        </Text>
+                        <Text style={styles.resultText}>
+                          Classes not attended: {result.remaining}
+                        </Text>
+                        <Text style={[styles.resultText, { color: '#f1e05a' }]}>
+                          💡 Currently above 60% - condonation available
+                        </Text>
+                        {Number(subject.dutyLeaves) > 0 && (
+                          <Text style={styles.resultText}>
+                            Duty leaves: {subject.dutyLeaves}
+                          </Text>
+                        )}
+                      </>
+                    )}
+                    
+                    {result.status.includes("Ineligible") && (
+                      <>
+                        <Text style={styles.resultText}>
+                          Reason: {result.reason}
+                        </Text>
+                        {result.classesNeededForTarget > 0 && (
+                          <Text style={styles.resultText}>
+                            Need {result.classesNeededForTarget} more {result.classesNeededForTarget === 1 ? 'class' : 'classes'} for {result.targetAttendance}% target
+                          </Text>
+                        )}
+                      </>
                     )}
                   </>
                 )}
@@ -1359,19 +1819,87 @@ export default function App() {
         })}
 
         <View style={styles.buttonContainer}>
-          <TouchableOpacity style={styles.secondaryButton} onPress={() => setShowResults(false)}>
-            <Text style={styles.secondaryButtonText}>← Back to Subjects</Text>
-          </TouchableOpacity>
-          
-          <TouchableOpacity style={styles.dangerButton} onPress={resetApp}>
-            <Text style={styles.dangerButtonText}>🔄 Start Over</Text>
-          </TouchableOpacity>
+          <Button mode="outlined" onPress={() => setShowResults(false)} style={{ flex: 1, marginRight: 8 }}>
+            ← Back to Subjects
+          </Button>
+          <Button mode="contained" onPress={resetApp} style={{ flex: 1, marginLeft: 8 }}>
+            Start Over
+          </Button>
         </View>
 
         <View style={styles.footerPrivacy}>
           <Text style={styles.footerPrivacyText}>
-            🔒 All your data is stored locally and privately on your device
+            All your data is stored locally and privately on your device
           </Text>
+        </View>
+
+        {/* Social Media Links */}
+        <View style={styles.socialLinksContainer}>
+          <Text style={styles.socialLinksTitle}>Check me out</Text>
+          <View style={styles.socialButtonsContainer}>
+            <View style={styles.socialButtonsTopRow}>
+              <Button 
+                mode="contained-tonal" 
+                icon="instagram" 
+                onPress={() => {
+                  Linking.openURL("https://www.instagram.com/the.adhithyan?igsh=ZHRicWh5eGdheWtq").catch(err => 
+                    console.error("Failed to open Instagram link:", err)
+                  );
+                }}
+                style={styles.socialButton}
+                buttonColor="#E4405F"
+                textColor="#ffffff"
+              >
+                Instagram
+              </Button>
+              <Button 
+                mode="contained-tonal" 
+                icon="linkedin" 
+                onPress={() => {
+                  Linking.openURL("https://www.linkedin.com/in/adhithyan-k-r/").catch(err => 
+                    console.error("Failed to open LinkedIn link:", err)
+                  );
+                }}
+                style={styles.socialButton}
+                buttonColor="#0A66C2"
+                textColor="#ffffff"
+              >
+                LinkedIn
+              </Button>
+            </View>
+            <View style={styles.socialButtonsBottomRow}>
+              <Button 
+                mode="contained-tonal" 
+                icon="github" 
+                onPress={() => {
+                  Linking.openURL("https://github.com/theadhithyankr").catch(err => 
+                    console.error("Failed to open GitHub link:", err)
+                  );
+                }}
+                style={styles.socialButtonSingle}
+                buttonColor="#333333"
+                textColor="#ffffff"
+              >
+                GitHub
+              </Button>
+            </View>
+          </View>
+        </View>
+
+        {/* Support Section */}
+        <View style={styles.supportContainer}>
+          <Button 
+            mode="contained" 
+            icon="cup" 
+            onPress={() => {
+              setProteinShakeModalVisible(true);
+            }}
+            style={styles.coffeeButton}
+            buttonColor="#4CAF50"
+            textColor="#ffffff"
+          >
+            Buy me a protein shake
+          </Button>
         </View>
         
         {/* Custom Alert Modal */}
@@ -1411,6 +1939,71 @@ export default function App() {
             </View>
           </View>
         </Modal>
+
+        {/* Protein Shake Payment Modal */}
+        <Modal
+          transparent={true}
+          animationType="slide"
+          visible={proteinShakeModalVisible}
+          onRequestClose={() => setProteinShakeModalVisible(false)}
+        >
+          <View style={styles.alertOverlay}>
+            <View style={styles.proteinShakeContainer}>
+              <Text style={styles.proteinShakeTitle}>Buy me a protein shake</Text>
+              
+              {/* Show description for selected amount */}
+              <Text style={styles.proteinShakeDescription}>
+                ₹{proteinShakeAmount} – {proteinShakeDescriptions[proteinShakeAmount]}
+              </Text>
+              
+              <View style={styles.amountGrid}>
+                {[5, 25, 50, 75, 100, 1000].map((amount) => (
+                  <TouchableOpacity
+                    key={amount}
+                    style={[
+                      styles.amountBox,
+                      proteinShakeAmount === amount && styles.amountBoxSelected
+                    ]}
+                    onPress={() => setProteinShakeAmount(amount)}
+                  >
+                    <Text style={[
+                      styles.amountText,
+                      proteinShakeAmount === amount && styles.amountTextSelected
+                    ]}>
+                      ₹{amount}
+                    </Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+
+              <View style={styles.proteinShakeButtons}>
+                <Button
+                  mode="outlined"
+                  onPress={() => setProteinShakeModalVisible(false)}
+                  style={styles.proteinShakeCancelButton}
+                  textColor="#666"
+                >
+                  Cancel
+                </Button>
+                <Button
+                  mode="contained"
+                  onPress={() => {
+                    const upiUrl = `upi://pay?pa=theadhithyankr-1@oksbi&pn=${encodeURIComponent("Adhithyan")}&am=${proteinShakeAmount}&cu=INR&tn=${encodeURIComponent("Protein Shake - KTU Attendance App")}`;
+                    Linking.openURL(upiUrl).catch(() => {
+                      Alert.alert("UPI Payment", `UPI ID: theadhithyankr-1@oksbi\nAmount: ₹${proteinShakeAmount}`);
+                    });
+                    setProteinShakeModalVisible(false);
+                  }}
+                  style={styles.proteinShakePayButton}
+                  buttonColor="#4CAF50"
+                  textColor="#ffffff"
+                >
+                  Pay ₹{proteinShakeAmount}
+                </Button>
+              </View>
+            </View>
+          </View>
+        </Modal>
       </ScrollView>
     );
   }
@@ -1418,7 +2011,7 @@ export default function App() {
   // Fallback render - should not happen, but prevents crashes
   return (
     <View style={styles.container}>
-  <StatusBar style="light" />
+      <StatusBar style="light" hidden={true} />
       <Text style={styles.welcomeTitle}>Loading...</Text>
     </View>
   );
@@ -1426,99 +2019,244 @@ export default function App() {
 
 const styles = StyleSheet.create({
   container: {
-    flexGrow: 1,
-    backgroundColor: "#0d1117",
-    padding: 20,
-    paddingTop: 50,
+    flex: 1,
+    backgroundColor: '#1A1A1A', // Focus app dark theme
+  },
+  scrollContent: {
+    padding: 16,
+  },
+  resultsContentContainer: {
+    padding: 16,
+    paddingBottom: 100, // Extra padding for bottom actions
   },
   profileSetupContainer: {
-    flex: 1,
-    justifyContent: "center",
-  },
-  profileHeader: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    alignItems: "center",
-    marginBottom: 20,
-    paddingHorizontal: 4,
-  },
-  profileHeaderText: {
-    fontSize: 18,
-    fontWeight: "600",
-    color: "#f0f6fc",
-  },
-  editProfileButton: {
-    backgroundColor: "#21262d",
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    borderRadius: 6,
-    borderWidth: 1,
-    borderColor: "#30363d",
-  },
-  editProfileText: {
-    color: "#8b949e",
-    fontSize: 12,
-  },
-  requiredNote: {
-    fontSize: 12,
-    color: "#8b949e",
-    fontStyle: "italic",
-    marginBottom: 16,
-    textAlign: "center",
-  },
-  privacyNotice: {
-    backgroundColor: "#0f2419",
-    borderRadius: 12,
     padding: 16,
-    marginBottom: 20,
-    borderWidth: 1,
-    borderColor: "#238636",
-    flexDirection: "row",
-    alignItems: "flex-start",
+  },
+  welcomeHeader: {
+    alignItems: 'center',
+    marginBottom: 24,
+    paddingVertical: 16,
+  },
+  welcomeTitle: {
+    textAlign: 'center',
+    marginBottom: 8,
+  },
+  subtitle: {
+    textAlign: 'center',
+  },
+  privacyCard: {
+    marginBottom: 16,
   },
   privacyIcon: {
-    fontSize: 24,
-    marginRight: 12,
-    marginTop: 2,
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginRight: 16,
   },
   privacyTextContainer: {
     flex: 1,
   },
   privacyTitle: {
     fontSize: 16,
-    fontWeight: "600",
-    color: "#238636",
+    fontWeight: '600',
+    color: '#E8EAED',
     marginBottom: 8,
+    textAlign: 'left', // Keep this left-aligned as it's part of a horizontal layout
   },
   privacyText: {
-    fontSize: 13,
-    color: "#7dd3fc",
-    lineHeight: 18,
+    lineHeight: 20,
+  },
+  profileCard: {
+    marginBottom: 16,
+  },
+  subjectCard: {
+    marginBottom: 16,
+  },
+  subjectsListCard: {
+    marginBottom: 16,
+  },
+  cardTitle: {
+    fontSize: 18,
+    fontWeight: '600',
+    color: '#E8EAED',
+    marginBottom: 16,
+    textAlign: 'center',
+    letterSpacing: 0.5,
+  },
+  importOptionsContainer: {
+    marginBottom: 16,
+    padding: 16,
+    backgroundColor: '#2D2D30',
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#5F6368',
+  },
+  sectionTitle: {
+    color: '#E8EAED',
+    textAlign: 'center',
+    marginBottom: 16,
+    fontWeight: '600',
+  },
+  importButton: {
+    backgroundColor: '#238636',
+    marginBottom: 12,
+  },
+  optionButtonContent: {
+    paddingVertical: 8,
+  },
+  importHelpText: {
+    textAlign: 'center',
+    fontStyle: 'italic',
+    color: '#9AA0AC',
+    lineHeight: 16,
+    fontSize: 12,
+  },
+  importSection: {
+    marginBottom: 16,
+    padding: 16,
+    backgroundColor: '#2D2D30',
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#5F6368',
+  },
+  importButtonContent: {
+    paddingVertical: 8,
+  },
+  inputGroup: {
+    marginBottom: 16,
+  },
+  label: {
+    marginBottom: 8,
+  },
+  requiredNote: {
+    textAlign: 'center',
+    fontStyle: 'italic',
+    marginBottom: 16,
   },
   privacyReminder: {
-    backgroundColor: "#161b22",
-    borderRadius: 8,
     padding: 12,
+    borderRadius: 8,
     marginBottom: 16,
-    borderLeftWidth: 3,
-    borderLeftColor: "#238636",
   },
   privacyReminderText: {
-    fontSize: 12,
-    color: "#7dd3fc",
-    textAlign: "center",
+    textAlign: 'center',
+    fontStyle: 'italic',
+  },
+  buttonContainer: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginTop: 16,
+    paddingHorizontal: 16,
+  },
+  subjectItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingVertical: 12,
+    paddingHorizontal: 8,
+    marginBottom: 8,
+    borderRadius: 8,
+  },
+  editingSubject: {
+    borderWidth: 2,
+  },
+  subjectInfo: {
+    flex: 1,
+  },
+  subjectActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  subjectName: {
+    marginBottom: 4,
+  },
+  subjectStats: {
+    opacity: 0.7,
   },
   footerPrivacy: {
-    marginTop: 20,
-    padding: 12,
-    backgroundColor: "#161b22",
-    borderRadius: 8,
+    marginTop: 16,
+    marginHorizontal: 8,
+    marginBottom: 16,
+    padding: 16,
+    backgroundColor: "#2D2D30",
+    borderRadius: 12,
     borderWidth: 1,
-    borderColor: "#30363d",
+    borderColor: "#5F6368",
   },
   footerPrivacyText: {
-    fontSize: 11,
-    color: "#8b949e",
+    fontSize: 12,
+    color: "#9AA0AC",
+    textAlign: "center",
+    fontStyle: "italic",
+  },
+  socialLinksContainer: {
+    marginTop: 8,
+    marginHorizontal: 8,
+    marginBottom: 16,
+    padding: 16,
+    backgroundColor: "#2D2D30",
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: "#5F6368",
+    alignItems: "center",
+  },
+  socialLinksTitle: {
+    fontSize: 14,
+    color: "#E8EAED",
+    textAlign: "center",
+    fontWeight: "600",
+    marginBottom: 12,
+  },
+  socialButtonsContainer: {
+    alignItems: "center",
+  },
+  socialButtonsTopRow: {
+    flexDirection: "row",
+    justifyContent: "center",
+    gap: 12,
+    marginBottom: 8,
+  },
+  socialButtonsBottomRow: {
+    flexDirection: "row",
+    justifyContent: "center",
+  },
+  socialButton: {
+    borderRadius: 8,
+    minWidth: 100,
+    flex: 1,
+  },
+  socialButtonSingle: {
+    borderRadius: 8,
+    minWidth: 100,
+  },
+  supportContainer: {
+    marginTop: 8,
+    marginHorizontal: 8,
+    marginBottom: 16,
+    padding: 16,
+    backgroundColor: "#2D2D30",
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: "#5F6368",
+    alignItems: "center",
+  },
+  supportTitle: {
+    fontSize: 14,
+    color: "#E8EAED",
+    textAlign: "center",
+    fontWeight: "600",
+    marginBottom: 12,
+  },
+  coffeeButton: {
+    borderRadius: 8,
+    marginBottom: 8,
+    minWidth: 160,
+  },
+  supportText: {
+    fontSize: 12,
+    color: "#9AA0AC",
     textAlign: "center",
     fontStyle: "italic",
   },
@@ -1535,11 +2273,16 @@ const styles = StyleSheet.create({
     marginBottom: 8,
   },
   appTitle: {
-    fontSize: 28,
-    fontWeight: "bold",
+    fontSize: 32,
+    fontWeight: "900",
     color: "#f0f6fc",
     textAlign: "center",
-    marginBottom: 10,
+    marginTop: 59,
+    marginBottom: 12,
+    letterSpacing: 0.5,
+    textShadowColor: "rgba(0, 0, 0, 0.3)",
+    textShadowOffset: { width: 0, height: 1 },
+    textShadowRadius: 2,
   },
   subtitle: {
     fontSize: 16,
@@ -1550,7 +2293,7 @@ const styles = StyleSheet.create({
   genderButton: {
     width: "100%",
     maxWidth: 280,
-    padding: 20,
+    padding: 16,
     borderRadius: 12,
     marginBottom: 16,
     borderWidth: 2,
@@ -1581,26 +2324,40 @@ const styles = StyleSheet.create({
   headerTitle: {
     fontSize: 24,
     fontWeight: "bold",
-    color: "#f0f6fc",
+    color: "#E8EAED",
+    textAlign: 'center',
   },
   headerSubtitle: {
     fontSize: 14,
-    color: "#8b949e",
+    color: "#9AA0AC",
     marginTop: 4,
+    textAlign: 'center',
   },
   card: {
     backgroundColor: "#161b22",
     borderRadius: 12,
-    padding: 20,
+    padding: 16,
     marginBottom: 16,
     borderWidth: 1,
     borderColor: "#30363d",
   },
   cardTitle: {
     fontSize: 18,
-    fontWeight: "bold",
-    color: "#f0f6fc",
+    fontWeight: '600',
+    color: '#E8EAED',
     marginBottom: 16,
+    textAlign: 'center',
+    letterSpacing: 0.5,
+  },
+  editingNotice: {
+    fontSize: 14,
+    color: "#d29922",
+    backgroundColor: "#2d2102",
+    padding: 12,
+    borderRadius: 8,
+    marginBottom: 16,
+    textAlign: "center",
+    fontWeight: "600",
   },
   inputGroup: {
     marginBottom: 16,
@@ -1704,7 +2461,7 @@ const styles = StyleSheet.create({
   addButton: {
     backgroundColor: "#238636",
     borderRadius: 8,
-    padding: 14,
+    padding: 12,
     alignItems: "center",
   },
   addButtonText: {
@@ -1715,7 +2472,7 @@ const styles = StyleSheet.create({
   cancelButton: {
     backgroundColor: "#da3633",
     borderRadius: 8,
-    padding: 14,
+    padding: 12,
     alignItems: "center",
     marginTop: 8,
   },
@@ -1773,7 +2530,9 @@ const styles = StyleSheet.create({
   buttonContainer: {
     flexDirection: "row",
     justifyContent: "space-between",
-    marginTop: 20,
+    marginTop: 16,
+    marginHorizontal: 8,
+    paddingBottom: 16,
   },
   primaryButton: {
     backgroundColor: "#238636",
@@ -1823,17 +2582,18 @@ const styles = StyleSheet.create({
     textAlign: "center",
   },
   statsCard: {
-    backgroundColor: "#161b22",
+    backgroundColor: "#35363A",
     borderRadius: 12,
-    padding: 20,
+    padding: 16,
     marginBottom: 16,
+    marginHorizontal: 4,
     borderWidth: 1,
-    borderColor: "#238636",
+    borderColor: "#81C995",
   },
   statsTitle: {
     fontSize: 18,
     fontWeight: "bold",
-    color: "#f0f6fc",
+    color: "#E8EAED",
     marginBottom: 16,
     textAlign: "center",
   },
@@ -1857,8 +2617,10 @@ const styles = StyleSheet.create({
   resultCard: {
     borderRadius: 12,
     padding: 16,
-    marginBottom: 12,
+    marginBottom: 16,
+    marginHorizontal: 4, // Small horizontal margin to prevent edge touching
     borderWidth: 1,
+    backgroundColor: '#2D2D30',
   },
   eligibleCard: {
     backgroundColor: "#0f2419",
@@ -1955,7 +2717,7 @@ const styles = StyleSheet.create({
   alertContainer: {
     backgroundColor: "#21262d",
     borderRadius: 12,
-    padding: 24,
+    padding: 16,
     minWidth: 280,
     maxWidth: 340,
     borderColor: "#30363d",
@@ -2002,6 +2764,73 @@ const styles = StyleSheet.create({
   },
   alertButtonTextDestructive: {
     color: "#f0f6fc",
+  },
+  proteinShakeContainer: {
+    backgroundColor: "#21262d",
+    borderRadius: 12,
+    padding: 20,
+    minWidth: 320,
+    maxWidth: 380,
+    borderColor: "#30363d",
+    borderWidth: 1,
+  },
+  proteinShakeTitle: {
+    fontSize: 18,
+    fontWeight: "bold",
+    color: "#f0f6fc",
+    marginBottom: 20,
+    textAlign: "center",
+  },
+  proteinShakeDescription: {
+    fontSize: 14,
+    color: "#8b949e",
+    textAlign: "center",
+    marginBottom: 16,
+    fontStyle: "italic",
+    paddingHorizontal: 8,
+  },
+  amountGrid: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    justifyContent: "space-between",
+    marginBottom: 24,
+    gap: 8,
+  },
+  amountBox: {
+    backgroundColor: "#161b22",
+    borderColor: "#30363d",
+    borderWidth: 1,
+    borderRadius: 8,
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    minWidth: 80,
+    alignItems: "center",
+    marginBottom: 8,
+  },
+  amountBoxSelected: {
+    backgroundColor: "#4CAF50",
+    borderColor: "#4CAF50",
+  },
+  amountText: {
+    fontSize: 16,
+    fontWeight: "600",
+    color: "#f0f6fc",
+  },
+  amountTextSelected: {
+    color: "#ffffff",
+  },
+  proteinShakeButtons: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    marginTop: 24,
+    gap: 12,
+  },
+  proteinShakeCancelButton: {
+    flex: 1,
+    borderColor: "#666",
+  },
+  proteinShakePayButton: {
+    flex: 1,
   },
   customDropdown: {
     backgroundColor: "#21262d",
@@ -2146,5 +2975,99 @@ const styles = StyleSheet.create({
   modalDropdownText: {
     color: "#f0f6fc",
     fontSize: 16,
+  },
+  previewCard: {
+    marginBottom: 16,
+  },
+  mappingContainer: {
+    marginTop: 8,
+  },
+  mappingText: {
+    color: '#9AA0AC',
+    fontSize: 14,
+    marginBottom: 4,
+  },
+  previewSubjectCard: {
+    backgroundColor: '#21262d',
+    padding: 12,
+    borderRadius: 8,
+    marginBottom: 12,
+    borderWidth: 1,
+    borderColor: '#30363d',
+  },
+  previewSubjectHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 4,
+  },
+  previewSubjectCode: {
+    color: '#f0f6fc',
+    fontWeight: 'bold',
+    fontSize: 16,
+  },
+  previewAttendance: {
+    color: '#238636',
+    fontWeight: 'bold',
+    fontSize: 16,
+  },
+  previewSubjectName: {
+    color: '#f0f6fc',
+    fontSize: 14,
+    marginBottom: 8,
+  },
+  previewSubjectDetails: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 12,
+  },
+  previewDetailText: {
+    color: '#9AA0AC',
+    fontSize: 12,
+  },
+  previewButtonContainer: {
+    flexDirection: 'row',
+    marginTop: 20,
+  },
+  previewButton: {
+    flex: 0,
+  },
+  importNavigationContainer: {
+    marginTop: 16,
+    padding: 12,
+    backgroundColor: '#21262d',
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#30363d',
+  },
+  importNavigationText: {
+    color: '#f0f6fc',
+    textAlign: 'center',
+    fontWeight: 'bold',
+    marginBottom: 8,
+  },
+  importNavigationButtons: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    gap: 8,
+  },
+  navigationButton: {
+    flex: 1,
+  },
+  finalAttendanceContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginTop: 12,
+    padding: 8,
+    backgroundColor: '#21262d',
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: '#30363d',
+  },
+  finalAttendanceLabel: {
+    color: '#f0f6fc',
+    fontSize: 14,
+    marginLeft: 12,
+    flex: 1,
   },
 });
