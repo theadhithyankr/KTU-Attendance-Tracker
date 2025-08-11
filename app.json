@@ -36,8 +36,12 @@
         {
           "iCloudContainerEnvironment": "Production"
         }
-      ]
+      ],
+      "expo-dev-client"
     ],
+    "developmentClient": {
+      "silentLaunch": true
+    },
     "extra": {
       "eas": {
         "projectId": "c4bc3cd6-c0be-4162-8c08-32a5d391f335"
